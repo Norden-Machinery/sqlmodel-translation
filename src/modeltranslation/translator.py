@@ -5,6 +5,7 @@ from functools import wraps
 from types import UnionType
 from typing import Any, get_args, get_origin
 
+from pydantic import BaseModel
 from pydantic._internal._decorators import Decorator, FieldSerializerDecoratorInfo
 from pydantic_core import PydanticUndefined
 from sqlalchemy import Column
@@ -256,6 +257,15 @@ class Translator:
         return model
 
     def _rebuild_model(self, model: type[SQLModel], options: TranslationOptions) -> None:
+        def _find_field_owner(search_model: type[SQLModel], field: str) -> type[SQLModel]:
+            """Find which class in the hierarchy actually defines this field."""
+            for base in search_model.__mro__:
+                if base is BaseModel or base is SQLModel or base is object:
+                    continue
+                if field in getattr(base, '__annotations__', {}):
+                    return base
+            return search_model  # default if not found
+
         def make_serializer(field_name: str) -> Callable:
             def serial(self: type[SQLModel], _: Any) -> Any:  # noqa: ANN401
                 return getattr(self, field_name)
@@ -263,13 +273,14 @@ class Translator:
             return serial
 
         for field in options.fields:
+            field_owner = _find_field_owner(model, field)
             orig_type = model.__table__.columns[field].type  # pyright: ignore[reportAttributeAccessIssue]
-            orig_annotation = model.__annotations__[field]
+            orig_annotation = field_owner.__annotations__[field]
 
             # change field to be Nullable
             model.__table__.columns[field].nullable = True  # pyright: ignore[reportAttributeAccessIssue]
-            model.__annotations__[field] = self._make_optional(orig_annotation)
-            model.model_fields[field].annotation = model.__annotations__[field]
+            field_owner.__annotations__[field] = self._make_optional(orig_annotation)
+            model.model_fields[field].annotation = field_owner.__annotations__[field]
 
             # create the serializer function
             serializer_func = make_serializer(field)
@@ -317,6 +328,7 @@ class Translator:
                 model.model_fields[translation_field] = pydantic_field
                 model.__annotations__[translation_field] = translation_annotation
 
+                field_owner.__annotations__[translation_field] = translation_annotation
                 setattr(model, translation_field, column_property(column))
 
         model.model_rebuild(force=True)
